@@ -159,6 +159,23 @@ delete_timeout = 60
 timeout = 60
 
 
+# ==================== 模型别名（虚拟路由）====================
+# 虚拟模型名对外通过 /v1/chat/completions、/v1/images/generations、
+# /v1/images/edits 三个端点暴露。路由规则：
+#   - chat/completions：content 含 type=image_url 块 → image_to_image，
+#     否则 → text_to_image
+#   - images/generations（纯文生图端点）：强制 → text_to_image
+#   - images/edits（图生图端点）：强制 → image_to_image
+# 两条腿至少配置一条；未配置的一条被命中时返回 400。
+# 别名名称不可与 registry 中真实模型重名。可配置多个别名。
+
+[models.alias.grok-image-all]
+text_to_image  = "grok-imagine-image-pro"
+image_to_image = "grok-imagine-image-edit"
+public_name    = "Grok Image (All)"
+enabled        = true
+
+
 # ==================== 批量操作 ====================
 [batch]
 # 开启 NSFW 并发数（token 级，每个 token 需三步网络请求）

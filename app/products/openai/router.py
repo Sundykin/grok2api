@@ -16,10 +16,12 @@ from app.platform.errors import AppError, ValidationError
 from app.platform.logging.logger import logger
 from app.platform.storage import image_files_dir, video_files_dir
 from app.control.model import registry as model_registry
+from app.control.model import alias as model_alias
 from app.control.model.spec import ModelSpec
 from .schemas import (
     ChatCompletionRequest,
     ImageGenerationRequest,
+    MessageItem,
     VideoConfig,
     ImageConfig,
     ResponsesCreateRequest,
@@ -58,22 +60,46 @@ def _model_available_for_pools(spec: ModelSpec, pools: frozenset[str]) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _alias_is_available(
+    alias: model_alias.ImageAlias, pools: frozenset[str]
+) -> bool:
+    """An alias is listable when at least one leg resolves to an available model."""
+    for leg in (alias.text_to_image, alias.image_to_image):
+        if not leg:
+            continue
+        spec = model_registry.get(leg)
+        if spec is not None and _model_available_for_pools(spec, pools):
+            return True
+    return False
+
+
 @router.get("/models", tags=[_TAG_MODELS], dependencies=[Depends(verify_api_key)])
 async def list_models(request: Request):
     import time
+    from app.platform.config.snapshot import get_config
 
     pools = await _available_pools(request)
+    now = int(time.time())
     models = [
         {
             "id": m.model_name,
             "object": "model",
-            "created": int(time.time()),
+            "created": now,
             "owned_by": "xai",
             "name": m.public_name,
         }
         for m in model_registry.list_enabled()
         if _model_available_for_pools(m, pools)
     ]
+    for alias in model_alias.load_aliases(get_config()).values():
+        if _alias_is_available(alias, pools):
+            models.append({
+                "id": alias.name,
+                "object": "model",
+                "created": now,
+                "owned_by": "router",
+                "name": alias.public_name,
+            })
     return JSONResponse({"object": "list", "data": models})
 
 
@@ -82,27 +108,43 @@ async def list_models(request: Request):
 )
 async def get_model_endpoint(model_id: str, request: Request):
     import time
+    from app.platform.config.snapshot import get_config
+
+    pools = await _available_pools(request)
+    now = int(time.time())
 
     spec = model_registry.get(model_id)
-    pools = await _available_pools(request)
-    if spec is None or not _model_available_for_pools(spec, pools):
+    if spec is not None and _model_available_for_pools(spec, pools):
         return JSONResponse(
             {
-                "error": {
-                    "message": f"Model {model_id!r} not found",
-                    "type": "invalid_request_error",
-                }
-            },
-            status_code=404,
+                "id": spec.model_name,
+                "object": "model",
+                "created": now,
+                "owned_by": "xai",
+                "name": spec.public_name,
+            }
         )
+
+    alias = model_alias.lookup(get_config(), model_id)
+    if alias is not None and _alias_is_available(alias, pools):
+        return JSONResponse(
+            {
+                "id": alias.name,
+                "object": "model",
+                "created": now,
+                "owned_by": "router",
+                "name": alias.public_name,
+            }
+        )
+
     return JSONResponse(
         {
-            "id": spec.model_name,
-            "object": "model",
-            "created": int(time.time()),
-            "owned_by": "xai",
-            "name": spec.public_name,
-        }
+            "error": {
+                "message": f"Model {model_id!r} not found",
+                "type": "invalid_request_error",
+            }
+        },
+        status_code=404,
     )
 
 
@@ -169,6 +211,44 @@ _USER_BLOCK_TYPES = {"text", "image_url", "input_audio", "file"}
 _ALLOWED_SIZES = {"1280x720", "720x1280", "1792x1024", "1024x1792", "1024x1024"}
 _EFFORT_VALUES = {"none", "minimal", "low", "medium", "high", "xhigh"}
 _LITE_IMAGE_MODELS = {"grok-imagine-image-lite"}
+
+
+def _messages_have_image(messages: list[MessageItem]) -> bool:
+    """Return True if any message carries a ``type=image_url`` content block."""
+    for msg in messages:
+        content = msg.content
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "image_url":
+                return True
+    return False
+
+
+def _resolve_image_model(cfg, model_name: str, *, has_image: bool) -> str:
+    """Return the real model name, following alias routing when applicable.
+
+    Raises ValidationError if *model_name* is a configured alias but the
+    current request shape (text-only vs. has-image) has no leg configured.
+    """
+    alias = model_alias.lookup(cfg, model_name)
+    if alias is None:
+        return model_name
+    target = model_alias.target_for(alias, has_image=has_image)
+    if target is None:
+        kind = "image-input" if has_image else "text-only"
+        raise ValidationError(
+            f"Model {alias.name!r} is not configured for {kind} requests",
+            param="model",
+            code="alias_leg_not_configured",
+        )
+    return target
+
+
+def _apply_alias_rewrite(req: ChatCompletionRequest, cfg) -> None:
+    """Rewrite ``req.model`` in place via alias routing for /v1/chat/completions."""
+    has_image = _messages_have_image(req.messages)
+    req.model = _resolve_image_model(cfg, req.model, has_image=has_image)
 
 
 def _validate_chat(req: ChatCompletionRequest) -> None:
@@ -240,10 +320,11 @@ async def _upload_to_data_uri(upload: UploadFile, *, param: str) -> str:
     "/chat/completions", tags=[_TAG_CHAT], dependencies=[Depends(verify_api_key)]
 )
 async def chat_completions_endpoint(req: ChatCompletionRequest):
-    _validate_chat(req)
     from app.platform.config.snapshot import get_config
 
     cfg = get_config()
+    _apply_alias_rewrite(req, cfg)
+    _validate_chat(req)
     is_stream = (
         req.stream if req.stream is not None else cfg.get_bool("features.stream", True)
     )
@@ -471,6 +552,9 @@ async def responses_endpoint(req: ResponsesCreateRequest):
     "/images/generations", tags=[_TAG_IMAGES], dependencies=[Depends(verify_api_key)]
 )
 async def image_generations(req: ImageGenerationRequest):
+    from app.platform.config.snapshot import get_config
+
+    req.model = _resolve_image_model(get_config(), req.model, has_image=False)
     spec = model_registry.get(req.model)
     if spec is None or not spec.enabled or not spec.is_image():
         raise ValidationError(
@@ -572,6 +656,9 @@ async def image_edits(
     size: Annotated[str, Form()] = "1024x1024",
     response_format: Annotated[str, Form()] = "url",
 ):
+    from app.platform.config.snapshot import get_config
+
+    model = _resolve_image_model(get_config(), model, has_image=True)
     spec = model_registry.get(model)
     if spec is None or not spec.enabled or not spec.is_image_edit():
         raise ValidationError(
