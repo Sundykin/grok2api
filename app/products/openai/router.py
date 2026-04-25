@@ -4,7 +4,9 @@ import asyncio
 import base64
 import binascii
 import mimetypes
-from typing import Annotated, AsyncGenerator, AsyncIterable, Literal
+from typing import Annotated, Any, AsyncGenerator, AsyncIterable, Literal
+
+import json
 
 import orjson
 from fastapi import APIRouter, Depends, File, Form, Query, Request, UploadFile
@@ -581,30 +583,156 @@ async def image_generations(req: ImageGenerationRequest):
 # ---------------------------------------------------------------------------
 
 
+_VIDEO_SIZE_CHOICES = frozenset(
+    {"720x1280", "1280x720", "1024x1024", "1024x1792", "1792x1024"}
+)
+_VIDEO_RESOLUTION_CHOICES = frozenset({"480p", "720p"})
+_VIDEO_PRESET_CHOICES = frozenset({"fun", "normal", "spicy", "custom"})
+
+
+def _coerce_reference_url(item: Any) -> str | None:
+    """Pull a URL/data-URI string out of the assorted shapes clients send.
+
+    Accepts bare strings plus OpenAI-style nested blocks — e.g. `{"url": ...}`,
+    `{"image_url": "..."}`, `{"image_url": {"url": ...}}`, and the multimodal
+    content block `{"type": "image_url", "image_url": {"url": ...}}`.
+    """
+    if isinstance(item, str):
+        stripped = item.strip()
+        return stripped or None
+    if not isinstance(item, dict):
+        return None
+    for key in ("url", "image_url"):
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        if isinstance(value, dict):
+            nested = value.get("url")
+            if isinstance(nested, str) and nested.strip():
+                return nested.strip()
+    return None
+
+
+def _validate_choice(value: str | None, choices: frozenset[str], *, param: str) -> None:
+    if value is None:
+        return
+    if value not in choices:
+        raise ValidationError(f"Unsupported {param}: {value!r}", param=param)
+
+
 @router.post("/videos", tags=[_TAG_VIDEOS], dependencies=[Depends(verify_api_key)])
-async def videos_create(
-    model: Annotated[str, Form(...)],
-    prompt: Annotated[str, Form(...)],
-    seconds: Annotated[int, Form()] = 6,
-    size: Annotated[
-        Literal["720x1280", "1280x720", "1024x1024", "1024x1792", "1792x1024"], Form()
-    ] = "720x1280",
-    resolution_name: Annotated[Literal["480p", "720p"] | None, Form()] = None,
-    preset: Annotated[
-        Literal["fun", "normal", "spicy", "custom"] | None, Form()
-    ] = None,
-    input_reference: Annotated[
-        list[UploadFile] | None, File(alias="input_reference[]")
-    ] = None,
-):
+async def videos_create(request: Request):
+    """Create a video.
+
+    Accepts two body shapes so both the OpenAI `videos.create` SDK and JSON
+    relays (e.g. new-api's TaskSubmitReq) work:
+
+    - `multipart/form-data` — fields `model`, `prompt`, `seconds`, `size`,
+      `resolution_name`, `preset` + `input_reference[]` file uploads.
+    - `application/json`    — same scalar fields; reference images can come
+      in via `images` / `input_reference` / `image_reference` as a URL or
+      data-URI string array (each item may also be an OpenAI multimodal
+      `{"image_url": {"url": ...}}` block).
+    """
     from .video import create_video
 
-    references_payload = None
-    if input_reference:
-        references_payload = [
-            {"image_url": await _upload_to_data_uri(f, param="input_reference")}
-            for f in input_reference[:5]
-        ]
+    content_type = (request.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+
+    model: str
+    prompt: str
+    seconds: int
+    size: str
+    resolution_name: str | None
+    preset: str | None
+    references_payload: list[dict[str, Any]] | None
+
+    if content_type == "application/json":
+        try:
+            body = await request.json()
+        except (ValueError, json.JSONDecodeError) as exc:
+            raise ValidationError("Invalid JSON body", param="body") from exc
+        if not isinstance(body, dict):
+            raise ValidationError("Body must be a JSON object", param="body")
+
+        model = str(body.get("model") or "").strip()
+        if not model:
+            raise ValidationError("Field required", param="model")
+        prompt = str(body.get("prompt") or "").strip()
+        if not prompt:
+            raise ValidationError("Field required", param="prompt")
+
+        seconds_raw = body.get("seconds", 6)
+        try:
+            seconds = int(seconds_raw)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError(
+                "seconds must be an integer", param="seconds"
+            ) from exc
+
+        size = str(body.get("size") or "720x1280").strip()
+        _validate_choice(size, _VIDEO_SIZE_CHOICES, param="size")
+        resolution_name = body.get("resolution_name") or None
+        _validate_choice(resolution_name, _VIDEO_RESOLUTION_CHOICES, param="resolution_name")
+        preset = body.get("preset") or None
+        _validate_choice(preset, _VIDEO_PRESET_CHOICES, param="preset")
+
+        raw_refs: Any = (
+            body.get("images")
+            if body.get("images") is not None
+            else body.get("input_reference")
+            if body.get("input_reference") is not None
+            else body.get("image_reference")
+        )
+        ref_urls: list[str] = []
+        if isinstance(raw_refs, str):
+            url = _coerce_reference_url(raw_refs)
+            if url:
+                ref_urls.append(url)
+        elif isinstance(raw_refs, list):
+            for item in raw_refs:
+                url = _coerce_reference_url(item)
+                if url:
+                    ref_urls.append(url)
+
+        references_payload = (
+            [{"image_url": url} for url in ref_urls[:5]] if ref_urls else None
+        )
+    else:
+        form = await request.form()
+        model = str(form.get("model") or "").strip()
+        if not model:
+            raise ValidationError("Field required", param="model")
+        prompt = str(form.get("prompt") or "").strip()
+        if not prompt:
+            raise ValidationError("Field required", param="prompt")
+
+        seconds_raw = form.get("seconds")
+        try:
+            seconds = int(seconds_raw) if seconds_raw not in (None, "") else 6
+        except (TypeError, ValueError) as exc:
+            raise ValidationError(
+                "seconds must be an integer", param="seconds"
+            ) from exc
+
+        size = str(form.get("size") or "720x1280").strip()
+        _validate_choice(size, _VIDEO_SIZE_CHOICES, param="size")
+        resolution_name_raw = form.get("resolution_name")
+        resolution_name = str(resolution_name_raw).strip() if resolution_name_raw else None
+        _validate_choice(resolution_name, _VIDEO_RESOLUTION_CHOICES, param="resolution_name")
+        preset_raw = form.get("preset")
+        preset = str(preset_raw).strip() if preset_raw else None
+        _validate_choice(preset, _VIDEO_PRESET_CHOICES, param="preset")
+
+        uploads: list[UploadFile] = []
+        for key, value in form.multi_items():
+            if key in ("input_reference", "input_reference[]") and isinstance(value, UploadFile):
+                uploads.append(value)
+        references_payload = None
+        if uploads:
+            references_payload = [
+                {"image_url": await _upload_to_data_uri(f, param="input_reference")}
+                for f in uploads[:5]
+            ]
 
     result = await create_video(
         model=model or "grok-video",
